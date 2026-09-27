@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# Host coordinator. Project behavior lives in .devcontainer/project.json/compose.yaml.
+set -euo pipefail
+if ((BASH_VERSINFO[0] < 4)); then
+  echo "error: Bash 4 or newer is required" >&2
+  exit 1
+fi
+label=dev.agent-starter.task
+child_pid='' child_group=false started=false task_directory=''
+fail() { echo "error: $*" >&2; exit 1; }
+valid_project() { [[ "$1" =~ ^[a-z][a-z0-9-]*-agent-[0-9a-f]{24}$ ]]; }
+resource_ids() {
+  if [[ "$1" == container ]]; then docker ps -aq --filter "$2"
+  else docker "$1" ls -q --filter "$2"; fi
+}
+cleanup_project() {
+  local project=$1 kind identifier ids containers=() volumes=() networks=()
+  valid_project "$project" || fail 'cleanup requires an exact task project name'
+  # Check ownership of every resource before deleting any of them.
+  for kind in container volume network; do
+    ids=$(resource_ids "$kind" "label=com.docker.compose.project=$project") || return
+    while IFS= read -r identifier; do
+      [[ -n "$identifier" ]] || continue
+      docker "$kind" inspect "$identifier" | jq -e --arg key "$label" --arg project "$project" \
+        '.[0] | (.Config.Labels // .Labels // {})[$key] == $project' >/dev/null || fail "unowned $kind: $identifier"
+      case "$kind" in
+        container) containers+=("$identifier") ;;
+        volume) volumes+=("$identifier") ;;
+        network) networks+=("$identifier") ;;
+      esac
+    done <<<"$ids"
+  done
+  if ((${#containers[@]})); then docker container rm -f "${containers[@]}" || return; fi
+  if ((${#volumes[@]})); then docker volume rm "${volumes[@]}" || return; fi
+  if ((${#networks[@]})); then docker network rm "${networks[@]}" || return; fi
+}
+# Called by the EXIT trap through finish.
+# shellcheck disable=SC2329
+stop_child() {
+  [[ -n "$child_pid" ]] || return 0
+  local target="$child_pid" attempt
+  if $child_group; then target="-$child_pid"; fi
+  kill -TERM -- "$target" 2>/dev/null || true
+  for ((attempt=0; attempt<100; attempt++)); do
+    kill -0 -- "$target" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -KILL -- "$target" 2>/dev/null || true
+  wait "$child_pid" 2>/dev/null || true
+  child_pid=''
+}
+run_group() {
+  local status=0
+  set -m
+  "$@" </dev/null &
+  child_pid=$! child_group=true
+  set +m
+  wait "$child_pid" || status=$?
+  child_pid=''
+  return "$status"
+}
+compose() { docker compose -p "$TASK_PROJECT" --env-file "$task_directory/empty.env" -f "$task_directory/compose.json" "$@"; }
+# shellcheck disable=SC2329
+finish() {
+  local status=$?
+  trap - EXIT INT TERM
+  stop_child
+  if $started && ! (cleanup_project "$TASK_PROJECT") >&2; then
+    echo "Cleanup failed. Retry: scripts/agent-container cleanup $TASK_PROJECT" >&2
+    echo "Task config retained at $task_directory" >&2
+    exit 1
+  fi
+  [[ -z "$task_directory" ]] || rm -rf -- "$task_directory"
+  exit "$status"
+}
+usage() {
+  echo 'usage: scripts/agent-container [--sterile] codex|claude|copilot|shell|exec COMMAND...|check|setup'
+  echo '       scripts/agent-container build|doctor|cleanup PROJECT'
+}
+sterile=false
+if [[ "${1:-}" == --sterile ]]; then sterile=true; shift; fi
+mode=${1:-}; (($# == 0)) || shift
+case "$mode" in
+  -h|--help) usage; exit ;;
+  build|doctor|check|setup) (($# == 0)) || fail "$mode takes no arguments" ;;
+  exec) (($# > 0)) || fail 'exec requires a command' ;;
+  cleanup) if [[ $# != 1 ]] || ! valid_project "$1"; then fail 'cleanup requires an exact task project name'; fi ;;
+  codex|claude|copilot|shell) ;;
+  *) usage >&2; exit 2 ;;
+esac
+[[ "${AGENT_DEV_CONTAINER:-}" != 1 ]] || fail 'already in a container; run the project command directly'
+for command in docker git jq; do command -v "$command" >/dev/null || fail "$command is required"; done
+docker info >/dev/null
+docker compose version >/dev/null
+if [[ "$mode" == cleanup ]]; then cleanup_project "$1"; exit; fi
+repository_root=$(git rev-parse --show-toplevel)
+cd "$repository_root"
+config=.devcontainer/project.json
+jq -e '
+  def argv: type=="array" and length>0 and all(.[]; type=="string" and (contains("\u0000")|not));
+  (.name | test("^[a-z][a-z0-9-]{0,39}$")) and
+  (.disposableDirectories | type=="array" and all(.[];
+    type=="string" and test("^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*$") and
+    (split("/") | all(. != ".." and . != "." and . != ".git" and . != ".devcontainer" and . != "scripts")))) and
+  (.environment | type=="object" and all(.[]; type=="string")) and
+  (.ports | type=="array" and all(.[]; type=="number" and floor==. and .>0 and .<65536)) and
+  (.services | type=="array" and all(.[]; type=="string" and test("^[a-zA-Z0-9][a-zA-Z0-9_-]*$") and .!="tool")) and
+  (.bootstrap | argv) and (.check | argv)
+' "$config" >/dev/null || fail 'invalid .devcontainer/project.json'
+name=$(jq -r .name "$config")
+trap finish EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# Hash the build context allowed by Dockerfile.dockerignore. Add manifests here
+# as well as to the allowlist if the project adds dependency-prefetch layers.
+if command -v sha256sum >/dev/null; then hash_command=(sha256sum); else hash_command=(shasum -a 256); fi
+digest=$("${hash_command[@]}" .devcontainer/Dockerfile .devcontainer/Dockerfile.dockerignore .devcontainer/entrypoint | "${hash_command[@]}")
+TASK_IMAGE="$name-agent:${digest:0:20}-$(id -u)-$(id -g)"
+export TASK_IMAGE
+if [[ "$mode" == build ]] || ! docker image inspect "$TASK_IMAGE" >/dev/null 2>&1; then
+  run_group docker build --file .devcontainer/Dockerfile --tag "$TASK_IMAGE" \
+    --build-arg "DEV_UID=$(id -u)" --build-arg "DEV_GID=$(id -g)" .
+fi
+if [[ "$mode" == build ]]; then exit; fi
+if [[ "$mode" == doctor ]]; then
+  # The script is evaluated by the container shell.
+  # shellcheck disable=SC2016
+  run_group docker run --rm --network=none "$TASK_IMAGE" bash -c \
+    'test "$(id -u)" != 0 && node --version && just --version && codex --version && claude --version && copilot --version'
+  exit
+fi
+TASK_PROJECT="$name-agent-$(od -An -N 12 -tx1 /dev/urandom | tr -d ' \n')"
+TASK_PASSWORD=$(od -An -N 24 -tx1 /dev/urandom | tr -d ' \n')
+export TASK_PROJECT TASK_PASSWORD
+task_directory=$(mktemp -d "${TMPDIR:-/tmp}/$TASK_PROJECT-XXXXXXXX")
+chmod 700 "$task_directory"
+touch "$task_directory/empty.env"
+# Resolve the editable Compose file once without loading the repository's .env.
+docker compose -p "$TASK_PROJECT" --env-file "$task_directory/empty.env" \
+  -f .devcontainer/compose.yaml config --format json > "$task_directory/base.json"
+# Avoid silently admitting persistent project data through a copied service.
+jq -e '
+  all((.volumes // {})[]; (.external // false)==false) and
+  all((.networks // {})[]; (.external // false)==false) and
+  all(.services[]; (has("container_name")|not) and
+    all((.volumes // [])[]; .type=="volume") and
+    all((.ports // [])[]; .host_ip=="127.0.0.1" and (.published|tostring)=="0"))
+' "$task_directory/base.json" >/dev/null || fail 'task Compose requires internal volumes/networks, no bind mounts/container_name, and dynamic loopback ports'
+mounts='[]'
+add_bind() {
+  mounts=$(jq -c --arg source "$1" --arg target "$2" --argjson readonly "${3:-false}" \
+    '. + [{type:"bind",source:$source,target:$target,read_only:$readonly,bind:{create_host_path:false}}]' <<<"$mounts")
+}
+add_bind "$repository_root" /workspace
+common=$(git rev-parse --path-format=absolute --git-common-dir)
+add_bind "$common" "$common" true
+add_bind "$repository_root/.git" /workspace/.git true
+# Mask existing ignored .env files without reading their contents. A linked
+# worktree's .git pointer and common directory are both read-only.
+while IFS= read -r -d '' path; do
+  case "${path##*/}" in .env|.env.*)
+    [[ "$path" == *.example ]] || add_bind "$task_directory/empty.env" "/workspace/$path" true ;;
+  esac
+done < <(git ls-files --cached --others --exclude-standard -z; git ls-files --others --ignored --exclude-standard -z)
+index=0
+while IFS= read -r path; do
+  # A dependency directory symlink must never redirect volume creation outside the repo.
+  current="$repository_root"
+  IFS=/ read -r -a components <<<"$path"
+  for component in "${components[@]}"; do
+    current="$current/$component"
+    [[ ! -L "$current" ]] || fail "symlink in disposable directory: $path"
+  done
+  mkdir -p "$repository_root/$path"
+  mounts=$(jq -c --arg source "workspace-$index" --arg target "/workspace/$path" \
+    '. + [{type:"volume",source:$source,target:$target,volume:{nocopy:true}}]' <<<"$mounts")
+  index=$((index+1))
+done < <(jq -r '.disposableDirectories[]' "$config")
+auth=''
+case "$mode" in
+  codex|claude|copilot)
+    if ! $sterile; then
+      auth="$name-agent-$mode-auth"
+      if docker volume inspect "$auth" >/dev/null 2>&1; then
+        docker volume inspect "$auth" | jq -e --arg name "$name" '.[0].Labels["dev.agent-starter.auth"]==$name' >/dev/null || fail "unowned auth volume: $auth"
+      else
+        docker volume create --label "dev.agent-starter.auth=$name" "$auth" >/dev/null
+      fi
+    fi ;;
+esac
+jq --slurpfile config "$config" --argjson mounts "$mounts" --arg project "$TASK_PROJECT" \
+  --arg label "$label" --arg auth "$auth" --arg mode "$mode" '
+  . as $base | $config[0] as $config |
+  .services.tool.volumes = $mounts |
+  .services.tool.environment = ((.services.tool.environment // {}) + $config.environment) |
+  .services.tool.ports = (if (["codex","claude","copilot","shell"]|index($mode)) then
+    [$config.ports[] | {target:.,published:"0",host_ip:"127.0.0.1",protocol:"tcp"}] else [] end) |
+  .volumes = ((.volumes // {}) + ([$mounts[] | select(.type=="volume") | {key:.source,value:{}}] | from_entries)) |
+  .networks.default = (.networks.default // {}) |
+  .services |= with_entries(.value.labels = ((.value.labels // {}) + {($label):$project})) |
+  .volumes |= with_entries(.value.name=($project+"_"+.key) | .value.labels = ((.value.labels // {}) + {($label):$project})) |
+  .networks |= with_entries(.value.name=($project+"_"+.key) | .value.labels = ((.value.labels // {}) + {($label):$project})) |
+  if $auth!="" then
+    .volumes.auth={external:true,name:$auth} |
+    .services.tool.volumes += [{type:"volume",source:"auth",target:("/home/dev/."+$mode),volume:{nocopy:true}}]
+  else . end |
+  walk(if type=="string" then gsub("\\$"; "$$") else . end)
+' "$task_directory/base.json" > "$task_directory/compose.json"
+services=()
+if [[ "$mode" != setup ]]; then
+  while IFS= read -r service; do services+=("$service"); done < <(jq -r '.services[]' "$config")
+fi
+echo "Task project: $TASK_PROJECT" >&2
+started=true
+run_group docker compose -p "$TASK_PROJECT" --env-file "$task_directory/empty.env" \
+  -f "$task_directory/compose.json" up -d --wait tool "${services[@]}"
+case "$mode" in
+  codex|claude|copilot|shell)
+    while IFS= read -r port; do
+      printf 'Port %s: http://%s\n' "$port" "$(compose port tool "$port")" >&2
+    done < <(jq -r '.ports[]' "$config") ;;
+esac
+exec_args=(exec --user dev)
+if [[ ! -t 0 || ! -t 1 ]]; then exec_args+=(-T); fi
+status=0
+compose "${exec_args[@]}" tool scripts/run-agent "$mode" "$@" <&0 &
+child_pid=$! child_group=false
+wait "$child_pid" || status=$?
+child_pid=''
+exit "$status"

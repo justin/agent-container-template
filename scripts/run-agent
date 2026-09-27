@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd /workspace
+run_hook() {
+  local args=() arg
+  # JSON argv is passed literally; use ["bash", "-c", "..."] for shell syntax.
+  while IFS= read -r -d '' arg; do args+=("$arg"); done < <(
+    jq -j --arg hook "$1" '.[$hook][] | ., "\u0000"' .devcontainer/project.json
+  )
+  "${args[@]}"
+}
+mode=${1:?expected setup, check, shell, exec, codex, claude, or copilot}
+shift
+if [[ "$mode" == setup ]]; then run_hook bootstrap; exit; fi
+run_hook bootstrap
+case "$mode" in
+  check) run_hook check ;;
+  shell) exec bash "$@" ;;
+  exec) exec "$@" ;;
+  codex) exec codex -c check_for_update_on_startup=false -c 'cli_auth_credentials_store="file"' "$@" ;;
+  claude) exec claude "$@" ;;
+  copilot) exec copilot --no-auto-update "$@" ;;
+  *) echo "error: unknown mode: $mode" >&2; exit 2 ;;
+esac

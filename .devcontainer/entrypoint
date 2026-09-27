@@ -1,0 +1,13 @@
+#!/bin/bash
+set -euo pipefail
+# Only change ownership of mounted volume roots, never the worktree recursively.
+if [[ $(id -u) == 0 ]]; then
+  if [[ -f /workspace/.devcontainer/project.json ]]; then
+    while IFS= read -r path; do
+      [[ -d "/workspace/$path" ]] && chown "dev:$(id -g dev)" "/workspace/$path"
+    done < <(jq -r '.disposableDirectories[]' /workspace/.devcontainer/project.json)
+  fi
+  chown "dev:$(id -g dev)" /home/dev/.codex /home/dev/.claude /home/dev/.copilot
+  exec gosu dev "$@"
+fi
+exec "$@"

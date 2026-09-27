@@ -1,0 +1,8 @@
+# Add project-owned supporting services here. The runner supplies tool mounts,
+# task environment, dynamic ports, and ownership labels for every resource.
+services:
+  tool:
+    image: ${TASK_IMAGE:?Run scripts/agent-container}
+    working_dir: /workspace
+    init: true
+    command: [sleep, infinity]

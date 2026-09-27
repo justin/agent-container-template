@@ -1,0 +1,31 @@
+{
+  "name": "Project Development",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "workspaceFolder": "/workspace",
+  "remoteUser": "dev",
+  "overrideCommand": false,
+  "mounts": [
+    "source=${devcontainerId}-node-modules,target=/workspace/node_modules,type=volume",
+    "source=${devcontainerId}-data,target=/workspace/.agent-data,type=volume",
+    "source=${devcontainerId}-codex,target=/home/dev/.codex,type=volume",
+    "source=${devcontainerId}-claude,target=/home/dev/.claude,type=volume",
+    "source=${devcontainerId}-copilot,target=/home/dev/.copilot,type=volume"
+  ],
+  "postCreateCommand": "scripts/run-agent setup",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "nefrob.vscode-just-syntax"
+      ],
+      "settings": {
+        "remote.otherPortsAttributes": {
+          "onAutoForward": "ignore"
+        }
+      }
+    }
+  }
+}

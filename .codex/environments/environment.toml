@@ -1,0 +1,33 @@
+version = 1
+name = "Container Starter"
+
+[setup]
+script = '''
+set -eu
+for command in docker git jq; do
+  command -v "$command" >/dev/null 2>&1 || {
+    echo "error: $command is required for the Project agent environment" >&2
+    exit 1
+  }
+done
+docker info >/dev/null 2>&1 || {
+  echo "error: the Docker daemon is unavailable" >&2
+  exit 1
+}
+echo "Project agent environment is ready; build or launch the container from an action"
+'''
+
+[[actions]]
+name = "Open Container Shell"
+icon = "run"
+command = "scripts/agent-container shell"
+
+[[actions]]
+name = "Run Container Checks"
+icon = "test"
+command = "scripts/agent-container --sterile check"
+
+[[actions]]
+name = "Build Agent Container"
+icon = "tool"
+command = "scripts/agent-container build"
